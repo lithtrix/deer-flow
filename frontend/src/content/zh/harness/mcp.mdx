@@ -63,7 +63,11 @@ DeerFlow 服务器启动时调用 `initialize_mcp_tools()`。这连接到所有�
 
 ### 缓存失效
 
-MCP 工具缓存追踪 `extensions_config.json` 的修改时间（`mtime`）。当文件更改时——例如通过 Gateway API 启用或禁用服务器时——缓存被标记为过时，下次请求时重新加载工具。
+MCP 工具缓存追踪 `extensions_config.json` 的解析路径和 `(mtime, size, sha256)` 内容签名。签名变化只是触发重新比对的信号：缓存会比较已启用服务器的解析后配置与全局 `mcpInterceptors` 列表，只有该有效切片真正变化时才会淘汰已缓存的工具和会话池。
+
+因此仅修改 Skills 或 middleware 不会重建工具或关闭会话；切换到另一份 MCP 配置完全相同的配置文件同样保留会话。启用、禁用或修改某个服务器会在下次请求时重新加载工具。当没有启用任何 MCP 服务器时，工具组装会回收此前已初始化的缓存与会话，但不会发起新的工具发现。
+
+Gateway 的显式 **重置 MCP 工具缓存**（`POST /api/mcp/cache/reset`）与此自动检查相互独立，始终清理缓存和会话池。
 
 这意味着 MCP 服务器更改无需重启 DeerFlow 服务器即可生效。
 
@@ -99,12 +103,47 @@ tool_search:
 
 OAuth 流程对 Lead Agent 是透明的——它只是调用工具，DeerFlow 处理认证。
 
+## 可选的身份钩子（identity hooks）
+
+部分外部身份或记忆提供方（例如 [Lithtrix](https://docs.lithtrix.ai/integrations/deerflow)）适合在研究线程开始时预取上下文。DeerFlow 可以可选地自动调用配置的 MCP 工具——无需将提供方代码导入 harness。
+
+在 `extensions_config.json` 中添加 `identityHooks` 块（可选；缺失或 `enabled: false` 时不做任何事）：
+
+```json
+{
+  "identityHooks": {
+    "enabled": true,
+    "mcpServerRef": "lithtrix",
+    "sessionStart": [
+      { "tool": "lithtrix_memory_context", "args": { "limit": 10 } },
+      { "tool": "lithtrix_commons_read", "args": { "page": 1, "per_page": 20 } }
+    ]
+  }
+}
+```
+
+- `mcpServerRef` 必须指向 `mcpServers` 中**已启用**的条目。
+- `tool` 是 MCP 服务器 `list_tools` 返回的原始工具名（在添加 `<server>_` 前缀供 agent 绑定之前）。
+- `args` 原样传给 MCP 工具；钩子失败仅记录日志，不阻塞研究。
+
+**v1 范围：** 仅 `sessionStart`。会话结束写入仍由 agent 驱动（例如通过 skill），待写入路径参数模板设计完成后再支持钩子。
+
+**Lithtrix 参考集成（3 个文件）：**
+
+| 文件 | 用途 |
+|------|------|
+| `extensions_config.json` | `mcpServers.lithtrix` + 可选 `identityHooks`；仅 `"skills": {}` |
+| `skills/public/use-lithtrix/SKILL.md` | 未启用钩子时给 agent 的说明 |
+| `.env`（gitignore） | `LITHTRIX_API_KEY`、`LITHTRIX_API_URL` — 见 `docs/examples/lithtrix/.env.example` |
+
+示例片段：`docs/examples/lithtrix/extensions_config.snippet.json`。Skill 从 `skills/public/<name>/SKILL.md` 自动发现——**不要**添加 `skills.<name>.path` 键。
+
 ## 管理 MCP 服务器
 
 MCP 服务器可以通过多种方式管理：
 
 - **通过 DeerFlow 应用界面**：扩展面板显示已连接的 MCP 服务器，允许你启用/禁用它们。
-- **通过 Gateway API**：`POST /api/extensions/mcp/{name}/enable` 和 `/disable`。
+- **通过 Gateway API**：`PATCH /api/mcp/config`，请求体为 `{"server_name": "<name>", "enabled": true}`（禁用时为 `false`；仅管理员）。
 - **直接编辑 `extensions_config.json`**：适用于脚本化或程序化配置。
 
 由于基于文件 mtime 的缓存失效机制，更改会自动被检测到。
